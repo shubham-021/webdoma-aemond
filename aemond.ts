@@ -121,7 +121,7 @@ const players: Record<
     args: [url, `--start=${startTime}`],
   }),
   vlc: (url, startTime) => ({
-    cmd: process.platform === "darwin" ?  "/Application/VLC/Contents/MacOS/vlc" : "vlc"
+    cmd: process.platform === "darwin" ?  "/Application/VLC/Contents/MacOS/vlc" : "vlc",
     args: [url, `--start-time=${timeToSeconds(startTime)}`],
   }),
   iina: (url, startTime) => ({
