@@ -121,12 +121,12 @@ const players: Record<
     args: [url, `--start=${startTime}`],
   }),
   vlc: (url, startTime) => ({
-    cmd: "vlc",
+    cmd: process.platform === "darwin" ?  "/Application/VLC/Contents/MacOS/vlc" : "vlc"
     args: [url, `--start-time=${timeToSeconds(startTime)}`],
   }),
   iina: (url, startTime) => ({
     // IINA's CLI tool (installed separately: `brew install --cask iina-cli` or via IINA app menu)
-    cmd: "iina-cli",
+    cmd: "iina",
     args: [url, `--mpv-start=${startTime}`],
   }),
 };
@@ -199,7 +199,7 @@ Bun.serve({
       try {
         const proc = spawn(cmd, args, {
           detached: true,
-          stdio: "ignore",
+          
         });
         proc.unref(); // let it run independently of this daemon
         proc.on("error", (err) => {
@@ -266,7 +266,7 @@ Bun.serve({
       try {
         const proc = spawn("syncplay", syncArgs, {
           detached: true,
-          stdio: "ignore",
+         
         });
         proc.unref();
         proc.on("error", (err) => {
