@@ -267,9 +267,9 @@ Bun.serve({
       syncArgs.push(videoUrl);
 
       try {
-        const proc = spawn("/Applications/Syncplay.app/Contents/MacOS/Syncplay", syncArgs, {
+        const syncplayCmd = process.platform === "darwin" ? "/Applications/Syncplay.app/Contents/MacOS/Syncplay" : "syncplay";
+        const proc = spawn(syncplayCmd, syncArgs, {
           detached: true,
-
         });
         proc.unref();
         proc.on("error", (err) => {
