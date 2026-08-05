@@ -121,7 +121,7 @@ const players: Record<
     args: [url, `--start=${startTime}`],
   }),
   vlc: (url, startTime) => ({
-    cmd: process.platform === "darwin" ?  "/Applications/VLC.app/Contents/MacOS/vlc" : "vlc",
+    cmd: process.platform === "darwin" ? "/Applications/VLC.app/Contents/MacOS/vlc" : "vlc",
     args: [url, `--start-time=${timeToSeconds(startTime)}`],
   }),
   iina: (url, startTime) => ({
@@ -186,7 +186,7 @@ Bun.serve({
         if (cipher) {
           videoUrl = decryptAemondPayload(cipher);
         } else if (requestUrl) {
-          videoUrl = requestUrl; 
+          videoUrl = requestUrl;
         } else {
           return json({ error: "Missing required field: either 'cipher' or 'url'" }, 400);
         }
@@ -199,7 +199,7 @@ Bun.serve({
       try {
         const proc = spawn(cmd, args, {
           detached: true,
-          
+
         });
         proc.unref(); // let it run independently of this daemon
         proc.on("error", (err) => {
@@ -225,13 +225,10 @@ Bun.serve({
         return json({ error: "Invalid JSON body" }, 400);
       }
 
-      const { player, cipher } = body;
+      const { player, cipher, url: requestUrl } = body;
 
       if (!player) {
         return json({ error: "Missing required field: 'player'" }, 400);
-      }
-      if (!cipher) {
-        return json({ error: "Missing required field: 'cipher'" }, 400);
       }
 
       // Re-read config on each request so users can hot-edit syncplay.conf
@@ -242,7 +239,13 @@ Bun.serve({
 
       let videoUrl: string;
       try {
-        videoUrl = decryptAemondPayload(cipher);
+        if (cipher) {
+          videoUrl = decryptAemondPayload(cipher);
+        } else if (requestUrl) {
+          videoUrl = requestUrl;
+        } else {
+          return json({ error: "Missing required field: either 'cipher' or 'url'" }, 400);
+        }
       } catch (err: any) {
         return json({ error: `Decryption failed: ${err.message}` }, 401);
       }
@@ -264,9 +267,9 @@ Bun.serve({
       syncArgs.push(videoUrl);
 
       try {
-        const proc = spawn("syncplay", syncArgs, {
+        const proc = spawn("/Applications/Syncplay.app/Contents/MacOS/Syncplay", syncArgs, {
           detached: true,
-         
+
         });
         proc.unref();
         proc.on("error", (err) => {
@@ -290,5 +293,5 @@ Bun.serve({
 
 console.log(`🎬 Player daemon running at http://localhost:${PORT}`);
 console.log(`   POST http://localhost:${PORT}/play      { player, cipher | url, startTime? }`);
-console.log(`   POST http://localhost:${PORT}/syncplay   { player, cipher }`);
+console.log(`   POST http://localhost:${PORT}/syncplay   { player, cipher | url }`);
 console.log(`   GET  http://localhost:${PORT}/health`);
