@@ -1,7 +1,9 @@
 import { spawn } from "child_process";
 import { createDecipheriv, createHash } from "crypto";
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, rmSync } from "fs";
 import { resolve, dirname } from "path";
+import { connect } from "node:net";
+import { tmpdir } from "os";
 import { fileURLToPath } from "url";
 
 const PORT = 9070;
@@ -90,6 +92,11 @@ interface PlayRequest {
   url?: string;
   cipher?: string;
   startTime?: string;
+  torrent_id?: number;
+  file_id?: number;
+  account_id?: number;
+  token?: string;
+  reportUrl?: string;
 }
 
 // Converts "HH:MM:SS" / "MM:SS" / "SS" -> total seconds
@@ -114,11 +121,13 @@ function extractFilename(url: string): string {
 // Each builder returns the executable to spawn + its argv.
 const players: Record<
   string,
-  (url: string, startTime: string) => { cmd: string; args: string[] }
+  (url: string, startTime: string, opts?: { socketPath?: string }) => { cmd: string; args: string[] }
 > = {
-  mpv: (url, startTime) => ({
+  mpv: (url, startTime, opts) => ({
     cmd: "mpv",
-    args: [url, `--start=${startTime}`],
+    args: opts?.socketPath
+      ? [url, `--start=${startTime}`, `--input-ipc-server=${opts.socketPath}`]
+      : [url, `--start=${startTime}`],
   }),
   vlc: (url, startTime) => ({
     cmd: process.platform === "darwin" ? "/Applications/VLC.app/Contents/MacOS/vlc" : "vlc",
@@ -131,11 +140,153 @@ const players: Record<
   }),
 };
 
-function resolveCommand(player: string, url: string, startTime: string) {
+function resolveCommand(player: string, url: string, startTime: string, opts?: { socketPath?: string }) {
   const builder = players[player.toLowerCase()];
-  if (builder) return builder(url, startTime);
+  if (builder) return builder(url, startTime, opts);
   // Unknown player name: treat it as the literal executable and just pass the url.
   return { cmd: player, args: [url] };
+}
+
+// ---------- mpv resume monitoring ----------
+
+interface MpvMonitorOptions {
+  reportUrl: string;
+  token: string;
+}
+
+// mpv creates the IPC socket itself; the daemon connects as a client.
+// Windows uses named pipes (no /tmp), posix uses a socket file.
+function buildMpvSocketPath(torrentId?: number, fileId?: number): string {
+  const rand = Math.random().toString(36).slice(2, 8);
+  if (process.platform === "win32") {
+    return `\\\\.\\pipe\\mpv_relay_${torrentId ?? "x"}_${fileId ?? "x"}_${rand}`;
+  }
+  return resolve(tmpdir(), `mpv_relay_${torrentId ?? "x"}_${fileId ?? "x"}_${rand}.sock`);
+}
+
+// Listens for mpv property-change / end-file events over the IPC socket and
+// reports playback position back to the server. Fire-and-forget; failures are
+// logged and never crash the daemon.
+function monitorMpv(socketPath: string, opts: MpvMonitorOptions) {
+  let client: ReturnType<typeof connect> | null = null;
+  let buffer = "";
+  let lastPos = 0;
+  let lastDuration: number | null = null;
+  let lastReported = 0;
+  let playing = true;
+  let connected = false;
+  let reportInterval: ReturnType<typeof setInterval> | null = null;
+  let finished = false;
+
+  const report = (position: number, duration: number | null, completed: boolean) => {
+    if (finished) return;
+    lastReported = position;
+    fetch(opts.reportUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: opts.token,
+        position: Math.max(0, position),
+        duration: duration ?? null,
+        completed,
+      }),
+    }).catch(() => {});
+  };
+
+  const teardown = () => {
+    if (finished) return;
+    finished = true;
+    if (reportInterval) {
+      clearInterval(reportInterval);
+      reportInterval = null;
+    }
+    if (client) {
+      try { client.destroy(); } catch { /* ignore */ }
+    }
+    if (process.platform !== "win32") {
+      try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
+    }
+  };
+
+  const handleMessage = (msg: any) => {
+    if (msg.event === "property-change") {
+      if (msg.id === 1 && typeof msg.data === "number") {
+        // time-pos fires many times/sec — just cache it (debounced via interval)
+        lastPos = msg.data;
+      } else if (msg.id === 2 && typeof msg.data === "boolean") {
+        playing = !msg.data;
+        if (msg.data === true) report(lastPos, lastDuration, false);
+      } else if (msg.id === 3 && typeof msg.data === "number") {
+        lastDuration = msg.data;
+      }
+    } else if (msg.event === "end-file") {
+      if (msg.reason === "eof") {
+        report(lastDuration ?? lastPos, lastDuration, true);
+      } else {
+        // quit / stop / redirect / error / unknown — keep last known position
+        report(lastPos, lastDuration, false);
+      }
+      teardown();
+    }
+  };
+
+  const attemptConnect = (attempt = 0) => {
+    if (finished) return;
+    const sock = connect(socketPath);
+    client = sock;
+    sock.setEncoding("utf8");
+
+    sock.on("connect", () => {
+      connected = true;
+      sock.write('{"command":["observe_property", 1, "time-pos"]}\n');
+      sock.write('{"command":["observe_property", 2, "pause"]}\n');
+      sock.write('{"command":["observe_property", 3, "duration"]}\n');
+      // Periodic checkpoint every 15s (covers crash/kill/machine sleep)
+      reportInterval = setInterval(() => {
+        if (playing && Math.abs(lastPos - lastReported) >= 5) {
+          report(lastPos, lastDuration, false);
+        }
+      }, 15000);
+    });
+
+    sock.on("data", (chunk) => {
+      buffer += chunk.toString("utf8");
+      let idx: number;
+      while ((idx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        try {
+          handleMessage(JSON.parse(line));
+        } catch {
+          // ignore malformed lines
+        }
+      }
+    });
+
+    sock.on("error", (err) => {
+      if (finished) return;
+      // mpv creates the socket shortly after spawn — retry until it exists.
+      if (!connected) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if ((code === "ENOENT" || code === "ECONNREFUSED" || code === "EPIPE") && attempt < 30) {
+          setTimeout(() => attemptConnect(attempt + 1), 100);
+          return;
+        }
+      }
+      console.error(`[${new Date().toISOString()}] mpv IPC error:`, err.message);
+    });
+
+    sock.on("close", () => {
+      connected = false;
+      if (reportInterval) {
+        clearInterval(reportInterval);
+        reportInterval = null;
+      }
+    });
+  };
+
+  attemptConnect();
 }
 
 function corsHeaders() {
@@ -174,7 +325,7 @@ Bun.serve({
         return json({ error: "Invalid JSON body" }, 400);
       }
 
-      const { player, url: requestUrl, cipher, startTime = "00:00" } = body;
+      const { player, url: requestUrl, cipher, startTime = "00:00", torrent_id, file_id, reportUrl, token } = body;
 
       if (!player) {
         return json({ error: "Missing required field: 'player'" }, 400);
@@ -194,7 +345,19 @@ Bun.serve({
         return json({ error: `Decryption failed: ${err.message}` }, 401);
       }
 
-      const { cmd, args } = resolveCommand(player, videoUrl, startTime);
+      // mpv only: enable IPC + progress reporting when the caller supplied a
+      // reportUrl and token. Backward-compatible — old callers skip this.
+      const socketPath =
+        (player || "").toLowerCase() === "mpv" && reportUrl && token
+          ? buildMpvSocketPath(torrent_id, file_id)
+          : undefined;
+
+      if (socketPath && process.platform !== "win32") {
+        // Remove a stale socket file left over from a previous run
+        try { rmSync(socketPath, { force: true }); } catch { /* ignore */ }
+      }
+
+      const { cmd, args } = resolveCommand(player, videoUrl, startTime, socketPath ? { socketPath } : undefined);
 
       try {
         const proc = spawn(cmd, args, {
@@ -205,6 +368,10 @@ Bun.serve({
         proc.on("error", (err) => {
           console.error(`[${new Date().toISOString()}] Spawn error for "${cmd}":`, err.message);
         });
+
+        if (socketPath && reportUrl && token) {
+          monitorMpv(socketPath, { reportUrl, token });
+        }
 
         const displayUrl = args[0] ? extractFilename(args[0]) : "unknown";
         console.log(`[${new Date().toISOString()}] Launched: ${cmd} "${displayUrl}" (start: ${startTime})`);
